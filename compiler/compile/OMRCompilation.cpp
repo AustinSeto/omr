@@ -2616,7 +2616,10 @@ TR_BitVector* BitVectorPool::get()
 void BitVectorPool::release (TR_BitVector* v)
    {
    v->empty();
-   _pool.push(v);
+   if (!std::uncaught_exception())
+      {
+      _pool.push(v);
+      }
    }
 
 
