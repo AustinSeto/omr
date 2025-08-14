@@ -32,7 +32,13 @@ Checklist::Checklist(TR::Compilation *c)
     , _v(allocBV())
 {}
 
-Checklist::~Checklist() { _comp->getBitVectorPool().release(_v); }
+Checklist::~Checklist()
+{
+    if (!std::uncaught_exception())
+    {
+        _comp->getBitVectorPool().release(_v);
+    }
+}
 
 Checklist::Checklist(const Checklist &other)
     : _comp(other._comp)
