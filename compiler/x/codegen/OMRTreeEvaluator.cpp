@@ -5157,7 +5157,8 @@ TR::Register *OMR::X86::TreeEvaluator::vectorFPNaNHelper(TR::Node *node, TR::Reg
     TR::InstOpCode orOpcode = mr ? TR::InstOpCode::ORPDRegMem : TR::InstOpCode::ORPDRegReg;
     TR::InstOpCode cmpOpcode = et.isFloat() ? TR::InstOpCode::CMPPSRegRegImm1 : TR::InstOpCode::CMPPDRegRegImm1;
 
-    OMR::X86::Encoding cmpEncoding = cmpOpcode.getSIMDEncoding(&cg->comp()->target().cpu, vl);
+    OMR::X86::Encoding cmpEncoding
+        = cmpOpcode.getSIMDEncoding(&cg->comp()->target().cpu, vl, cg->supportsOpMaskRegisters());
     OMR::X86::Encoding movEncoding = movOpcode.getSIMDEncoding(&cg->comp()->target().cpu, vl);
 
     TR_ASSERT_FATAL(cmpEncoding != OMR::X86::Encoding::Bad, "No suitable encoding method for compare opcode");
@@ -5275,7 +5276,7 @@ TR::Register *OMR::X86::TreeEvaluator::vectorCompareEvaluator(TR::Node *node, TR
             break;
     }
 
-    if (cg->comp()->target().cpu.supportsFeature(OMR_FEATURE_X86_AVX512F)) {
+    if (cg->supportsOpMaskRegisters()) {
         TR::Register *resultReg = cg->allocateRegister(TR_VMR);
         TR::InstOpCode cmpOpcode = TR::InstOpCode::bad;
 
@@ -5333,13 +5334,20 @@ TR::Register *OMR::X86::TreeEvaluator::vectorCompareEvaluator(TR::Node *node, TR
 
         return resultReg;
     } else {
-        // For PRE-AVX512
+        // For PRE-AVX512 (Integers)
         //   EQ  -> EQ(a,b)
         //   NE  -> NOT (EQ(a,b))
         //   GT  -> GT(a,b)
         //   GTE -> NOT(GT(b,a))
         //   LT  -> GT(b,a)
         //   LTE -> NOT (GT(a,b))
+        //
+        // For PRE-AVX512 (Float)
+        //   LT  -> LT(a,b)
+        //   LTE -> LTE(a,b)
+        //   GT  -> LT(b,a)
+        //   GTE -> LTE(b,a)
+        //
         TR::Register *resultReg = cg->allocateRegister(TR_VRF);
         TR::InstOpCode cmpOpcode = TR::InstOpCode::bad;
         TR::InstOpCode invCmpOpcode = TR::InstOpCode::bad;
@@ -5373,6 +5381,32 @@ TR::Register *OMR::X86::TreeEvaluator::vectorCompareEvaluator(TR::Node *node, TR
                     break;
                 default:
                     TR_ASSERT_FATAL(0, "Unsupported comparison predicate");
+                    break;
+            }
+        } else {
+            // All ordered floating-point comparisons involving a NaN must return false.
+            // The CMPPS instruction uses an immediate value (predicate) to select the
+            // comparison operation. For floating-point vcmpgt/vcmpge operations we use
+            // LT/LTE predicates and swap the lhs/rhs operands due to a subtle issue
+            // with NaN handling on SSE. On SSE, GT/GTE predicates are not available.
+            // The alternative SSE predicates NLT/NLE must not be used because they
+            // negate the result of LT/LTE operation. This is illegal when handling
+            // NaN values because the result of any comparison involving NaN should be
+            // false.
+            switch (OMR::ILOpCode::getVectorOperation(opcode)) {
+                case TR::vcmpge:
+                case TR::vmcmpge:
+                    // GTE -> LTE(b,a)
+                    predicate = 2; // LTE predicate
+                    swapOperands = true;
+                    break;
+                case TR::vcmpgt:
+                case TR::vmcmpgt:
+                    // GT  -> LT(b,a)
+                    predicate = 1; // LT predicate
+                    swapOperands = true;
+                    break;
+                default:
                     break;
             }
         }
@@ -5412,7 +5446,7 @@ TR::Register *OMR::X86::TreeEvaluator::vectorCompareEvaluator(TR::Node *node, TR
                 break;
         }
 
-        OMR::X86::Encoding cmpEncoding = cmpOpcode.getSIMDEncoding(&cg->comp()->target().cpu, vl);
+        OMR::X86::Encoding cmpEncoding = cmpOpcode.getSIMDEncoding(&cg->comp()->target().cpu, vl, false);
         TR_ASSERT_FATAL(cmpEncoding != OMR::X86::Bad,
             "vectorCompareEvaluator: Selected illegal instruction for target hardware");
 
@@ -5434,7 +5468,7 @@ TR::Register *OMR::X86::TreeEvaluator::vectorCompareEvaluator(TR::Node *node, TR
         }
 
         if (invAfter) {
-            OMR::X86::Encoding invCmpEncoding = invCmpOpcode.getSIMDEncoding(&cg->comp()->target().cpu, vl);
+            OMR::X86::Encoding invCmpEncoding = invCmpOpcode.getSIMDEncoding(&cg->comp()->target().cpu, vl, false);
             TR::Register *invMaskReg = cg->allocateRegister(TR_VRF);
             // pcmpeq invMaskReg, invMaskReg
             // pxor resultReg, invMaskReg
@@ -6636,8 +6670,6 @@ TR::Register *OMR::X86::TreeEvaluator::ternaryVectorMaskHelper(TR::InstOpCode op
     generateRegRegInstruction(TR::InstOpCode::MOVDQURegReg, node, resultReg, lhsReg, cg, encoding);
 
     if (vectorMask) {
-        TR_ASSERT_FATAL(encoding == OMR::X86::VEX_L128 || encoding == OMR::X86::VEX_L256,
-            "AVX supported opcode required for ternary mask emulation");
         generateRegRegInstruction(TR::InstOpCode::MOVDQURegReg, node, tmpReg, lhsReg, cg);
         generateRegRegRegInstruction(opcode.getMnemonic(), node, tmpReg, middleReg, rhsReg, cg, encoding);
         vectorMergeMaskHelper(node, resultReg, tmpReg, maskReg, cg);
@@ -6742,7 +6774,6 @@ TR::Register *OMR::X86::TreeEvaluator::arrayToVectorMaskHelper(TR::Node *node, T
     TR::InstOpCode expandOp = TR::InstOpCode::bad;
     TR::InstOpCode v2mOp = TR::InstOpCode::bad;
     TR::InstOpCode shiftOp = TR::InstOpCode::PSLLQRegImm1;
-    bool nativeMasking = cg->comp()->target().cpu.supportsFeature(OMR_FEATURE_X86_AVX512F);
     TR::DataType integralType = et;
     int32_t shiftAmount = 0;
 
@@ -6798,7 +6829,7 @@ TR::Register *OMR::X86::TreeEvaluator::arrayToVectorMaskHelper(TR::Node *node, T
 
     cg->decReferenceCount(valueNode);
 
-    if (nativeMasking) {
+    if (cg->supportsOpMaskRegisters()) {
         TR::Register *result = cg->allocateRegister(TR_VMR);
         OMR::X86::Encoding v2mEncoding = v2mOp.getSIMDEncoding(&cg->comp()->target().cpu, vl);
         OMR::X86::Encoding shiftEncoding = shiftOp.getSIMDEncoding(&cg->comp()->target().cpu, vl);
